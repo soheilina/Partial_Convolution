@@ -36,8 +36,11 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 # import torchvision.models as models
 import torchvision.models as models_baseline # networks with zero padding
-import models as models_partial # partial conv based padding 
+import models as models_partial # partial conv based padding
 
+import tensorboard
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter('runs/PatialConv_1000')
 
 model_baseline_names = sorted(name for name in models_baseline.__dict__
     if name.islower() and not name.startswith("__")
@@ -51,8 +54,8 @@ model_names = model_baseline_names + model_partial_names
 
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-# parser.add_argument('data', metavar='DIR',
-#                     help='path to dataset')
+parser.add_argument('--data', metavar='DIR', default='../datasets/CelebA',
+                     help='path to dataset')
 parser.add_argument('--data_train', metavar='DIRTRAIN',
                     help='path to training dataset')
 
@@ -66,7 +69,7 @@ parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet50',
                         ' (default: resnet50)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=100, type=int, metavar='N',
+parser.add_argument('--epochs', default=3, type=int, metavar='N',
                     help='number of total epochs to run')
 # parser.add_argument('--epochs', default=90, type=int, metavar='N',
 #                     help='number of total epochs to run')
@@ -83,7 +86,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
-parser.add_argument('--print-freq', '-p', default=10, type=int,
+parser.add_argument('--print-freq', '-p', default=1, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -163,9 +166,13 @@ def main():
     # logging
     with open(args.logger_fname, "a") as log_file:
         log_file.write('model created\n')
-		
-		
-    if args.gpu is not None:
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"The available device is {device}.")
+
+    if device.type=='cpu':
+        model = model.to(device)
+    elif args.gpu is not None:
         model = model.cuda(args.gpu)
     elif args.distributed:
         model.cuda()
@@ -206,10 +213,21 @@ def main():
     cudnn.benchmark = True
 
     # Data loading code
-    # traindir = os.path.join(args.data, 'train')
-    # valdir = os.path.join(args.data, 'val')
-    traindir = args.data_train #os.path.join(args.data, 'train')
-    valdir = args.data_val  #os.path.join(args.data, 'val')
+    if not os.path.exists(args.data):
+        raise ValueError('The path to dataset is invalid.')
+    traindir = os.path.join(args.data, 'train')
+    valdir = os.path.join(args.data, 'val')
+    #traindir = args.data_train #os.path.join(args.data, 'train')
+    #valdir = args.data_val  #os.path.join(args.data, 'val')
+    if not os.path.exists(traindir):
+        raise ValueError('The path to dataset is invalid.')
+    if not os.path.exists(valdir):
+        raise ValueError('The path to dataset is invalid.')
+
+    print("Path to dataset: ", args.data)
+    print("Path to train_set: ", traindir)
+    print("Path to val_set: ", valdir)
+
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
@@ -299,13 +317,20 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
 
     end = time.time()
+    running_loss = 0.0
     for i, (input, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            input = input.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        if device.type != 'cpu':
+            if args.gpu is not None:
+                input = input.cuda(args.gpu, non_blocking=True)
+            target = target.cuda(args.gpu, non_blocking=True)
+        else:
+            input = input.to(device)
+            target = target.to(device)
 
         # compute output
         output = model(input)
@@ -325,6 +350,9 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
+
+        # calculates running_loss for tensorboard
+        running_loss += loss.item()
 
         if i % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
@@ -346,6 +374,12 @@ def train(train_loader, model, criterion, optimizer, epoch):
                     epoch, i, len(train_loader), batch_time=batch_time,
                     data_time=data_time, loss=losses, top1=top1, top5=top5))
 
+            # log the running loss on Tensorboard
+            writer.add_scalar('Training loss',
+                              running_loss / args.print_freq,
+                              epoch * len(train_loader) + i)
+            running_loss = 0
+
 
 def validate(val_loader, model, criterion):
     batch_time = AverageMeter()
@@ -358,10 +392,17 @@ def validate(val_loader, model, criterion):
 
     with torch.no_grad():
         end = time.time()
+        val_loss = 0.0
         for i, (input, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                input = input.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+            if device.type != 'cpu':
+                if args.gpu is not None:
+                    input = input.cuda(args.gpu, non_blocking=True)
+                target = target.cuda(args.gpu, non_blocking=True)
+            else:
+                input = input.to(device)
+                target = target.to(device)
 
             # compute output
             output = model(input)
@@ -376,6 +417,9 @@ def validate(val_loader, model, criterion):
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
+
+            # calculates val_loss for tensorboard
+            val_loss += loss.item()
 
             if i % args.print_freq == 0:
                 print('Test: [{0}/{1}]\t'
@@ -394,6 +438,17 @@ def validate(val_loader, model, criterion):
                       'Prec@5 {top5.val:.3f} ({top5.avg:.3f})\n'.format(
                        i, len(val_loader), batch_time=batch_time, loss=losses,
                        top1=top1, top5=top5))
+
+                # log the running loss on Tensorboard
+                writer.add_scalar('Val loss',
+                                  val_loss / args.print_freq,
+                                  i)
+                val_loss = 0
+
+                # log the running loss on Tensorboard
+                writer.add_scalar('Precision',
+                                  prec1,  # val_loss / args.print_freq,
+                                  i)
 
         print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
@@ -448,7 +503,7 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
